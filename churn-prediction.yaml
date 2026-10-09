@@ -1,0 +1,238 @@
+version: v1
+name: Customer RFM and churn-risk prototype
+
+inputs:
+  as_of_date:
+    type: string
+    default: '2027-05-18'
+
+pipeline:
+  check_source:
+    tasks:
+      check_sanitized_file:
+        integration: GCP_CLOUD_STORAGE
+        integration_job: GCP_CLOUD_STORAGE_GET_FILE
+        parameters:
+          bucket_name: YOUR_BUCKET
+          object_name: customer_transactions_sanitized.csv
+          file_encoding: utf-8
+        depends_on: []
+        name: Check sanitized transactions file
+        connection: replace_with_gcs_00000
+    depends_on: []
+    name: Check privacy-reduced source
+
+  prepare_bigquery:
+    tasks:
+      create_external_transactions:
+        integration: GCP_BIG_QUERY
+        integration_job: GCP_BQ_RUN_QUERY_JOB
+        parameters:
+          query: |
+            CREATE OR REPLACE EXTERNAL TABLE
+              `customer_churn_poc.ext_customer_transactions` (
+                customer_key STRING,
+                transaction_date STRING,
+                product_category STRING,
+                amount_gbp STRING,
+                channel STRING,
+                region STRING
+              )
+            OPTIONS (
+              format = 'CSV',
+              uris = ['gs://YOUR_BUCKET/customer_transactions_sanitized.csv'],
+              skip_leading_rows = 1,
+              allow_quoted_newlines = TRUE
+            )
+          set_outputs: false
+          enable_drive_scope: false
+        depends_on: []
+        name: Create external table over sanitized CSV
+        connection: replace_with_bigquery_00000
+
+      ensure_segments_table:
+        integration: GCP_BIG_QUERY
+        integration_job: GCP_BQ_RUN_QUERY_JOB
+        parameters:
+          query: |
+            CREATE TABLE IF NOT EXISTS `customer_churn_poc.customer_segments` (
+              snapshot_date DATE,
+              customer_key STRING,
+              recency_days INT64,
+              transaction_count INT64,
+              category_count INT64,
+              total_spend_gbp NUMERIC,
+              average_transaction_gbp NUMERIC,
+              missing_amount_transaction_count INT64,
+              channels ARRAY<STRING>,
+              regions ARRAY<STRING>,
+              recency_score INT64,
+              frequency_score INT64,
+              monetary_score INT64,
+              rfm_segment STRING,
+              inactivity_band STRING,
+              refreshed_at TIMESTAMP
+            )
+          set_outputs: false
+          enable_drive_scope: false
+        depends_on: []
+        name: Ensure customer segments table
+        connection: replace_with_bigquery_00000
+    depends_on:
+      - check_source
+    name: Prepare BigQuery source and destination
+
+  build_segments:
+    tasks:
+      refresh_customer_segments:
+        integration: GCP_BIG_QUERY
+        integration_job: GCP_BQ_RUN_QUERY_JOB
+        parameters:
+          query: |
+            MERGE `customer_churn_poc.customer_segments` T
+            USING (
+              WITH transaction_rows AS (
+                SELECT
+                  customer_key,
+                  SAFE_CAST(transaction_date AS DATE) AS transaction_date,
+                  product_category,
+                  SAFE_CAST(REPLACE(amount_gbp, ',', '') AS NUMERIC) AS amount_gbp,
+                  channel,
+                  region
+                FROM `customer_churn_poc.ext_customer_transactions`
+                WHERE customer_key IS NOT NULL
+                  AND customer_key != ''
+                  AND SAFE_CAST(transaction_date AS DATE)
+                    <= DATE '${{ inputs.as_of_date }}'
+              ),
+              customer_features AS (
+                SELECT
+                  customer_key,
+                  DATE_DIFF(
+                    DATE '${{ inputs.as_of_date }}',
+                    MAX(transaction_date),
+                    DAY
+                  ) AS recency_days,
+                  COUNT(*) AS transaction_count,
+                  COUNT(DISTINCT product_category) AS category_count,
+                  COALESCE(SUM(amount_gbp), 0) AS total_spend_gbp,
+                  SAFE_DIVIDE(SUM(amount_gbp), COUNT(amount_gbp))
+                    AS average_transaction_gbp,
+                  COUNTIF(amount_gbp IS NULL)
+                    AS missing_amount_transaction_count,
+                  ARRAY_AGG(DISTINCT channel IGNORE NULLS) AS channels,
+                  ARRAY_AGG(DISTINCT region IGNORE NULLS) AS regions
+                FROM transaction_rows
+                GROUP BY customer_key
+              ),
+              scored_customers AS (
+                SELECT
+                  *,
+                  NTILE(4) OVER (
+                    ORDER BY recency_days DESC, customer_key
+                  ) AS recency_score,
+                  NTILE(4) OVER (
+                    ORDER BY transaction_count, customer_key
+                  ) AS frequency_score,
+                  NTILE(4) OVER (
+                    ORDER BY total_spend_gbp, customer_key
+                  ) AS monetary_score
+                FROM customer_features
+              )
+              SELECT
+                DATE '${{ inputs.as_of_date }}' AS snapshot_date,
+                *,
+                CASE
+                  WHEN recency_score >= 3
+                    AND frequency_score >= 3
+                    AND monetary_score >= 3 THEN 'champions'
+                  WHEN recency_score >= 3
+                    AND frequency_score >= 3 THEN 'loyal'
+                  WHEN recency_score >= 3
+                    AND monetary_score >= 3 THEN 'recent_high_value'
+                  WHEN recency_score <= 2
+                    AND frequency_score >= 3 THEN 'loyal_but_lapsing'
+                  ELSE 'developing'
+                END AS rfm_segment,
+                CASE
+                  WHEN recency_days >= 90 THEN 'inactive_90d_plus'
+                  WHEN recency_days >= 60 THEN 'high_risk_60_89d'
+                  WHEN recency_days >= 30 THEN 'cooling_30_59d'
+                  ELSE 'recently_active'
+                END AS inactivity_band,
+                CURRENT_TIMESTAMP() AS refreshed_at
+              FROM scored_customers
+            ) S
+            ON T.snapshot_date = S.snapshot_date
+              AND T.customer_key = S.customer_key
+            WHEN MATCHED THEN UPDATE SET
+              recency_days = S.recency_days,
+              transaction_count = S.transaction_count,
+              category_count = S.category_count,
+              total_spend_gbp = S.total_spend_gbp,
+              average_transaction_gbp = S.average_transaction_gbp,
+              missing_amount_transaction_count =
+                S.missing_amount_transaction_count,
+              channels = S.channels,
+              regions = S.regions,
+              recency_score = S.recency_score,
+              frequency_score = S.frequency_score,
+              monetary_score = S.monetary_score,
+              rfm_segment = S.rfm_segment,
+              inactivity_band = S.inactivity_band,
+              refreshed_at = S.refreshed_at
+            WHEN NOT MATCHED BY TARGET THEN INSERT (
+              snapshot_date, customer_key, recency_days, transaction_count,
+              category_count, total_spend_gbp, average_transaction_gbp,
+              missing_amount_transaction_count, channels, regions,
+              recency_score, frequency_score, monetary_score, rfm_segment,
+              inactivity_band, refreshed_at
+            ) VALUES (
+              S.snapshot_date, S.customer_key, S.recency_days,
+              S.transaction_count, S.category_count, S.total_spend_gbp,
+              S.average_transaction_gbp,
+              S.missing_amount_transaction_count, S.channels, S.regions,
+              S.recency_score, S.frequency_score, S.monetary_score,
+              S.rfm_segment, S.inactivity_band, S.refreshed_at
+            )
+            WHEN NOT MATCHED BY SOURCE
+              AND T.snapshot_date = DATE '${{ inputs.as_of_date }}'
+              THEN DELETE
+          set_outputs: false
+          enable_drive_scope: false
+        depends_on: []
+        name: Calculate RFM segments and inactivity bands
+        connection: replace_with_bigquery_00000
+    depends_on:
+      - prepare_bigquery
+    name: Build customer segments
+
+  quality_check:
+    tasks:
+      no_invalid_segment_rows:
+        integration: GCP_BIG_QUERY
+        integration_job: GCP_BQ_RUN_TEST
+        parameters:
+          query: |
+            SELECT customer_key
+            FROM `customer_churn_poc.customer_segments`
+            WHERE snapshot_date = DATE '${{ inputs.as_of_date }}'
+              AND (
+                customer_key IS NULL
+                OR recency_days < 0
+                OR transaction_count <= 0
+                OR inactivity_band IS NULL
+                OR rfm_segment IS NULL
+              )
+          error_threshold_expression: "> 0"
+          warn_threshold_expression: "> 0"
+          enable_drive_scope: false
+        depends_on: []
+        name: No invalid customer segment rows
+        connection: replace_with_bigquery_00000
+    depends_on:
+      - build_segments
+    name: Validate segmentation output
+
+webhook:
+  enabled: false
