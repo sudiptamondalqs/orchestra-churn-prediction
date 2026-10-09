@@ -178,7 +178,7 @@ def prepare_transactions(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Write a privacy-reduced transaction CSV for the churn demo."
+        description="Write a privacy-reduced transaction CSV for the segmentation demo."
     )
     parser.add_argument("input_csv", type=Path)
     parser.add_argument("output_csv", type=Path)

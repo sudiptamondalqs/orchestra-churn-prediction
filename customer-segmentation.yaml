@@ -1,5 +1,5 @@
 version: v1
-name: Customer RFM and churn-risk prototype
+name: Customer segmentation
 
 inputs:
   as_of_date:
@@ -18,7 +18,7 @@ pipeline:
           file_encoding: utf-8
         depends_on: []
         name: Check generated transactions sample
-        connection: replace_with_gcs_00000
+        connection: orchestra_gcp_59732
     depends_on: []
     name: Check generated sample
 
@@ -30,7 +30,7 @@ pipeline:
         parameters:
           query: |
             CREATE OR REPLACE EXTERNAL TABLE
-              `customer_churn_poc.ext_customer_transactions` (
+              `customer_segmentation_poc.ext_customer_transactions` (
                 transaction_id STRING,
                 customer_id STRING,
                 customer_name STRING,
@@ -54,14 +54,14 @@ pipeline:
           enable_drive_scope: false
         depends_on: []
         name: Create external table over generated sample
-        connection: replace_with_bigquery_00000
+        connection: orchestra_gcp_52611
 
       ensure_segments_table:
         integration: GCP_BIG_QUERY
         integration_job: GCP_BQ_RUN_QUERY_JOB
         parameters:
           query: |
-            CREATE TABLE IF NOT EXISTS `customer_churn_poc.customer_segments` (
+            CREATE TABLE IF NOT EXISTS `customer_segmentation_poc.customer_segments` (
               snapshot_date DATE,
               customer_id STRING,
               recency_days INT64,
@@ -83,7 +83,7 @@ pipeline:
           enable_drive_scope: false
         depends_on: []
         name: Ensure customer segments table
-        connection: replace_with_bigquery_00000
+        connection: orchestra_gcp_52611
     depends_on:
       - check_source
     name: Prepare BigQuery source and destination
@@ -95,7 +95,7 @@ pipeline:
         integration_job: GCP_BQ_RUN_QUERY_JOB
         parameters:
           query: |
-            MERGE `customer_churn_poc.customer_segments` T
+            MERGE `customer_segmentation_poc.customer_segments` T
             USING (
               WITH transaction_rows AS (
                 SELECT
@@ -105,7 +105,7 @@ pipeline:
                   SAFE_CAST(REPLACE(amount_gbp, ',', '') AS NUMERIC) AS amount_gbp,
                   channel,
                   region
-                FROM `customer_churn_poc.ext_customer_transactions`
+                FROM `customer_segmentation_poc.ext_customer_transactions`
                 WHERE customer_id IS NOT NULL
                   AND customer_id != ''
                   AND SAFE_CAST(transaction_date AS DATE)
@@ -208,7 +208,7 @@ pipeline:
           enable_drive_scope: false
         depends_on: []
         name: Calculate RFM segments and inactivity bands
-        connection: replace_with_bigquery_00000
+        connection: orchestra_gcp_52611
     depends_on:
       - prepare_bigquery
     name: Build customer segments
@@ -221,7 +221,7 @@ pipeline:
         parameters:
           query: |
             SELECT customer_id
-            FROM `customer_churn_poc.customer_segments`
+            FROM `customer_segmentation_poc.customer_segments`
             WHERE snapshot_date = DATE '${{ inputs.as_of_date }}'
               AND (
                 customer_id IS NULL
@@ -235,7 +235,7 @@ pipeline:
           enable_drive_scope: false
         depends_on: []
         name: No invalid customer segment rows
-        connection: replace_with_bigquery_00000
+        connection: orchestra_gcp_52611
     depends_on:
       - build_segments
     name: Validate segmentation output
