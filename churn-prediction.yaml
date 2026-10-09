@@ -9,18 +9,18 @@ inputs:
 pipeline:
   check_source:
     tasks:
-      check_sanitized_file:
+      check_sample_file:
         integration: GCP_CLOUD_STORAGE
         integration_job: GCP_CLOUD_STORAGE_GET_FILE
         parameters:
-          bucket_name: YOUR_BUCKET
-          object_name: customer_transactions_sanitized.csv
+          bucket_name: orchestra-gcp-poc
+          object_name: customer_transactions.csv
           file_encoding: utf-8
         depends_on: []
-        name: Check sanitized transactions file
+        name: Check generated transactions sample
         connection: replace_with_gcs_00000
     depends_on: []
-    name: Check privacy-reduced source
+    name: Check generated sample
 
   prepare_bigquery:
     tasks:
@@ -31,23 +31,29 @@ pipeline:
           query: |
             CREATE OR REPLACE EXTERNAL TABLE
               `customer_churn_poc.ext_customer_transactions` (
-                customer_key STRING,
+                transaction_id STRING,
+                customer_id STRING,
+                customer_name STRING,
+                email STRING,
+                phone STRING,
+                date_of_birth STRING,
                 transaction_date STRING,
                 product_category STRING,
                 amount_gbp STRING,
                 channel STRING,
-                region STRING
+                region STRING,
+                last_updated STRING
               )
             OPTIONS (
               format = 'CSV',
-              uris = ['gs://YOUR_BUCKET/customer_transactions_sanitized.csv'],
+              uris = ['gs://orchestra-gcp-poc/customer_transactions.csv'],
               skip_leading_rows = 1,
               allow_quoted_newlines = TRUE
             )
           set_outputs: false
           enable_drive_scope: false
         depends_on: []
-        name: Create external table over sanitized CSV
+        name: Create external table over generated sample
         connection: replace_with_bigquery_00000
 
       ensure_segments_table:
@@ -57,7 +63,7 @@ pipeline:
           query: |
             CREATE TABLE IF NOT EXISTS `customer_churn_poc.customer_segments` (
               snapshot_date DATE,
-              customer_key STRING,
+              customer_id STRING,
               recency_days INT64,
               transaction_count INT64,
               category_count INT64,
@@ -93,21 +99,21 @@ pipeline:
             USING (
               WITH transaction_rows AS (
                 SELECT
-                  customer_key,
+                  customer_id,
                   SAFE_CAST(transaction_date AS DATE) AS transaction_date,
                   product_category,
                   SAFE_CAST(REPLACE(amount_gbp, ',', '') AS NUMERIC) AS amount_gbp,
                   channel,
                   region
                 FROM `customer_churn_poc.ext_customer_transactions`
-                WHERE customer_key IS NOT NULL
-                  AND customer_key != ''
+                WHERE customer_id IS NOT NULL
+                  AND customer_id != ''
                   AND SAFE_CAST(transaction_date AS DATE)
                     <= DATE '${{ inputs.as_of_date }}'
               ),
               customer_features AS (
                 SELECT
-                  customer_key,
+                  customer_id,
                   DATE_DIFF(
                     DATE '${{ inputs.as_of_date }}',
                     MAX(transaction_date),
@@ -123,19 +129,19 @@ pipeline:
                   ARRAY_AGG(DISTINCT channel IGNORE NULLS) AS channels,
                   ARRAY_AGG(DISTINCT region IGNORE NULLS) AS regions
                 FROM transaction_rows
-                GROUP BY customer_key
+                GROUP BY customer_id
               ),
               scored_customers AS (
                 SELECT
                   *,
                   NTILE(4) OVER (
-                    ORDER BY recency_days DESC, customer_key
+                    ORDER BY recency_days DESC, customer_id
                   ) AS recency_score,
                   NTILE(4) OVER (
-                    ORDER BY transaction_count, customer_key
+                    ORDER BY transaction_count, customer_id
                   ) AS frequency_score,
                   NTILE(4) OVER (
-                    ORDER BY total_spend_gbp, customer_key
+                    ORDER BY total_spend_gbp, customer_id
                   ) AS monetary_score
                 FROM customer_features
               )
@@ -164,7 +170,7 @@ pipeline:
               FROM scored_customers
             ) S
             ON T.snapshot_date = S.snapshot_date
-              AND T.customer_key = S.customer_key
+              AND T.customer_id = S.customer_id
             WHEN MATCHED THEN UPDATE SET
               recency_days = S.recency_days,
               transaction_count = S.transaction_count,
@@ -182,13 +188,13 @@ pipeline:
               inactivity_band = S.inactivity_band,
               refreshed_at = S.refreshed_at
             WHEN NOT MATCHED BY TARGET THEN INSERT (
-              snapshot_date, customer_key, recency_days, transaction_count,
+              snapshot_date, customer_id, recency_days, transaction_count,
               category_count, total_spend_gbp, average_transaction_gbp,
               missing_amount_transaction_count, channels, regions,
               recency_score, frequency_score, monetary_score, rfm_segment,
               inactivity_band, refreshed_at
             ) VALUES (
-              S.snapshot_date, S.customer_key, S.recency_days,
+              S.snapshot_date, S.customer_id, S.recency_days,
               S.transaction_count, S.category_count, S.total_spend_gbp,
               S.average_transaction_gbp,
               S.missing_amount_transaction_count, S.channels, S.regions,
@@ -214,11 +220,11 @@ pipeline:
         integration_job: GCP_BQ_RUN_TEST
         parameters:
           query: |
-            SELECT customer_key
+            SELECT customer_id
             FROM `customer_churn_poc.customer_segments`
             WHERE snapshot_date = DATE '${{ inputs.as_of_date }}'
               AND (
-                customer_key IS NULL
+                customer_id IS NULL
                 OR recency_days < 0
                 OR transaction_count <= 0
                 OR inactivity_band IS NULL
